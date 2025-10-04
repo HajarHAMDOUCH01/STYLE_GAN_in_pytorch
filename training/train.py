@@ -10,8 +10,9 @@ import os
 import gc
 from pathlib import Path
 from torch.amp import GradScaler, autocast
+import torch.nn.functional as F 
 
-import sys 
+import sys  
 sys.path.append("/content/Face-Generator-StyleGAN-PyTorch")
 
 from model.style_gan import StyleGAN, Discriminator
@@ -418,7 +419,6 @@ def plot_training_curves(g_losses, d_losses, r1_penalties, save_dir):
 
 
 if __name__ == "__main__":
-    import torch.nn.functional as F 
     
     generator, discriminator, g_losses, d_losses = train_stylegan(training_config, checkpoint_path="/content/drive/MyDrive/stylegan_checkpoints/stylegan_checkpoint_epoch_22.pth")
     print("\n✓ Training completed successfully!")
