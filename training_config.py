@@ -14,7 +14,6 @@ training_config = {
     "adam_beta2": 0.99,
     "adam_eps": 1e-8,
     
-    "r1_gamma": 10.0,    
     "style_mixing_prob": 0.9,  
     
     "r1_interval": 16,  
@@ -25,4 +24,10 @@ training_config = {
     "save_every": 2,
     "sample_every": 2,
     "log_every": 50,
+
+    "plr_weight": 2.0,      
+    "plr_interval": 4,      
+    "plr_decay": 0.01,      
+    
+    "r1_gamma": 15.0,
 }

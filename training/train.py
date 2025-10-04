@@ -23,6 +23,37 @@ torch.backends.cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+def path_length_regularization(fake_images, latents, mean_path_length, decay=0.01):
+    # Generate noise for computing gradients
+    batch_size = fake_images.shape[0]
+    noise = torch.randn_like(fake_images) / ((fake_images.shape[2] * fake_images.shape[3]) ** 0.5)
+    
+    # Compute gradients of images w.r.t. latents
+    # This measures how much the image changes when w changes
+    grad_outputs = (fake_images * noise).sum()
+    
+    gradients = torch.autograd.grad(
+        outputs=grad_outputs,
+        inputs=latents,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+    
+    # Compute path length (L2 norm of gradients)
+    path_lengths = torch.sqrt(gradients.pow(2).sum(dim=2).mean(dim=1))
+    
+    # Update exponential moving average of path length
+    if mean_path_length == 0:
+        mean_path_length = path_lengths.mean()
+    else:
+        mean_path_length = mean_path_length + decay * (path_lengths.mean() - mean_path_length)
+    
+    # Compute penalty: deviation from mean path length
+    path_loss = ((path_lengths - mean_path_length) ** 2).mean()
+    
+    return path_loss, mean_path_length.detach(), path_lengths.mean().item()
+
 
 class CelebADataset(Dataset):
     """CelebA dataset loader"""
@@ -232,6 +263,14 @@ def train_stylegan(config, checkpoint_path=None):
     d_losses = []
     r1_penalties = []
 
+    mean_path_length = torch.tensor(0.0, device=device)
+    plr_losses = []
+    
+    # PLR hyperparameters
+    plr_weight = config.get("plr_weight", 2.0)  
+    plr_interval = config.get("plr_interval", 4)  
+    plr_decay = config.get("plr_decay", 0.01) 
+
     for epoch in range(start_epoch, num_epochs):
         generator.train()
         discriminator.train()
@@ -239,6 +278,7 @@ def train_stylegan(config, checkpoint_path=None):
         epoch_g_loss = 0
         epoch_d_loss = 0
         epoch_r1 = 0
+        epoch_plr = 0
         num_batches = 0
         
         loop = tqdm(dataloader, leave=True, desc=f"Epoch {epoch+1}/{num_epochs}")
@@ -253,21 +293,18 @@ def train_stylegan(config, checkpoint_path=None):
             
             d_optimizer.zero_grad()
             
-            # Generate fake images (don't need gradients for G yet)
             z1 = torch.randn(batch_size_actual, z_dim, device=device)
             z2 = torch.randn(batch_size_actual, z_dim, device=device)
             
             with torch.no_grad():
                 fake_images, _ = generator(z1, z2)
             
-            # Discriminator forward
             real_scores = discriminator(real_images)
             fake_scores = discriminator(fake_images)
             
-            # Discriminator loss
             d_loss = d_logistic_loss(real_scores, fake_scores)
             
-            # R1 regularization (applies every r1_interval steps)
+            # R1 regularization
             r1_penalty = torch.tensor(0.0, device=device)
             if batch_idx % config["r1_interval"] == 0:
                 r1_penalty = compute_gradient_penalty(discriminator, real_images)
@@ -287,17 +324,41 @@ def train_stylegan(config, checkpoint_path=None):
             
             g_optimizer.zero_grad()
             
-            # Generate new fake images for generator update
             z1 = torch.randn(batch_size_actual, z_dim, device=device)
             z2 = torch.randn(batch_size_actual, z_dim, device=device)
             
-            fake_images, _ = generator(z1, z2)
+            fake_images, w = generator(z1, z2, return_w=True)
             fake_scores = discriminator(fake_images)
             
-            # Generator loss
             g_loss = g_nonsaturating_loss(fake_scores)
             
-            g_loss.backward()
+            # ==================== Path Length Regularization ====================
+            plr_loss = torch.tensor(0.0, device=device)
+            
+            if batch_idx % plr_interval == 0:
+                # Need to generate with gradients for PLR
+                # Create fresh latents that require gradients
+                z_plr = torch.randn(batch_size_actual, z_dim, device=device)
+                w_plr = generator.mapping(generator.mapping.pixel_norm(z_plr))
+                
+                # Make w require gradients for PLR computation
+                w_plr = w_plr.unsqueeze(1).repeat(1, generator.synthesis.num_layers, 1)
+                w_plr.requires_grad_(True)
+                
+                # Generate images with these latents
+                fake_plr = generator.synthesis(w_plr)
+                
+                # Compute path length regularization
+                plr_loss, mean_path_length, plr_value = path_length_regularization(
+                    fake_plr, w_plr, mean_path_length, decay=plr_decay
+                )
+                
+                g_loss_total = g_loss + plr_weight * plr_loss
+                epoch_plr += plr_value
+            else:
+                g_loss_total = g_loss
+            
+            g_loss_total.backward()
             g_optimizer.step()
             
             epoch_g_loss += g_loss.item()
@@ -307,25 +368,24 @@ def train_stylegan(config, checkpoint_path=None):
                 "G_loss": f"{g_loss.item():.4f}",
                 "D_loss": f"{d_loss.item():.4f}",
                 "R1": f"{r1_penalty.item():.4f}" if r1_penalty.item() > 0 else "0.0000",
+                "PLR": f"{plr_loss.item():.4f}" if plr_loss.item() > 0 else "0.0000",
                 "real_score": f"{real_scores.mean().item():.4f}",
                 "fake_score": f"{fake_scores.mean().item():.4f}",
             })
-            
-            if batch_idx % 200 == 0:
-                clear_memory()
         
         avg_g_loss = epoch_g_loss / num_batches
         avg_d_loss = epoch_d_loss / num_batches
         avg_r1 = epoch_r1 / max(1, num_batches // config["r1_interval"])
+        avg_plr = epoch_plr / max(1, num_batches // plr_interval)
         
-        g_losses.append(avg_g_loss)
-        d_losses.append(avg_d_loss)
-        r1_penalties.append(avg_r1)
+        plr_losses.append(avg_plr)
         
         print(f"\nEpoch {epoch+1} Complete:")
         print(f"  Generator Loss: {avg_g_loss:.4f}")
         print(f"  Discriminator Loss: {avg_d_loss:.4f}")
         print(f"  R1 Penalty: {avg_r1:.4f}")
+        print(f"  Path Length Penalty: {avg_plr:.4f}")
+        print(f"  Mean Path Length: {mean_path_length.item():.4f}")
         
         # Save checkpoint
         if (epoch + 1) % config["save_every"] == 0:
@@ -400,6 +460,6 @@ def plot_training_curves(g_losses, d_losses, r1_penalties, save_dir):
 if __name__ == "__main__":
     generator, discriminator, g_losses, d_losses = train_stylegan(
         training_config, 
-        checkpoint_path=None  # Set to your checkpoint path if resuming
+        checkpoint_path=None 
     )
     print("\n✓ Training completed successfully!")
