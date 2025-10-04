@@ -9,10 +9,9 @@ import matplotlib.pyplot as plt
 import os
 import gc
 from pathlib import Path
-from torch.amp import GradScaler, autocast
-import torch.nn.functional as F 
+import torch.nn.functional as F
 
-import sys  
+import sys 
 sys.path.append("/content/Face-Generator-StyleGAN-PyTorch")
 
 from model.style_gan import StyleGAN, Discriminator
@@ -20,7 +19,6 @@ from training_config import training_config
 
 
 torch.backends.cudnn.benchmark = True
-scaler = GradScaler("cuda")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -53,33 +51,31 @@ def get_transforms(img_size):
     ])
 
 
-def compute_gradient_penalty(discriminator, real_images, fake_images):
-    """R1 regularization (paper section C, equation from Mescheder et al.)"""
-    real_images.requires_grad_(True)
+def compute_gradient_penalty(discriminator, real_images):
+    """R1 regularization - simplified and correct"""
+    real_images = real_images.detach().requires_grad_(True)
     real_scores = discriminator(real_images)
     
     gradients = torch.autograd.grad(
         outputs=real_scores.sum(),
         inputs=real_images,
         create_graph=True,
-        retain_graph=True,
     )[0]
     
     # R1 penalty: ||∇D(x)||²
-    r1_penalty = gradients.pow(2).sum(dim=[1, 2, 3]).mean()
+    r1_penalty = gradients.pow(2).reshape(gradients.size(0), -1).sum(1).mean()
     return r1_penalty
 
 
-def discriminator_loss(real_scores, fake_scores):
-    # For real images: maximize log(D(x))
+def d_logistic_loss(real_scores, fake_scores):
+    """Non-saturating logistic loss for discriminator"""
     real_loss = F.softplus(-real_scores).mean()
-    # For fake images: maximize log(1 - D(G(z)))
     fake_loss = F.softplus(fake_scores).mean()
     return real_loss + fake_loss
 
 
-def generator_loss(fake_scores):
-    # Maximize log(D(G(z)))
+def g_nonsaturating_loss(fake_scores):
+    """Non-saturating loss for generator"""
     return F.softplus(-fake_scores).mean()
 
 
@@ -115,7 +111,7 @@ def generate_samples(generator, device, epoch, save_dir, num_samples=16):
     generator.train()
 
 
-def load_from_checkpoint(generator, discriminator, g_optimizer, d_optimizer, checkpoint_path=None):
+def load_from_checkpoint(generator, discriminator, g_optimizer, d_optimizer, checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     def strip_prefix(state_dict, prefix="_orig_mod."):
@@ -127,11 +123,9 @@ def load_from_checkpoint(generator, discriminator, g_optimizer, d_optimizer, che
     
     gen_state = checkpoint["generator_state_dict"]
     if any(k.startswith("synthesis._orig_mod") for k in gen_state.keys()):
-        # Checkpoint has _orig_mod prefix in synthesis module
         gen_state_fixed = {}
         for k, v in gen_state.items():
             if k.startswith("synthesis._orig_mod."):
-                # Remove _orig_mod from synthesis keys
                 new_key = k.replace("synthesis._orig_mod.", "synthesis.")
                 gen_state_fixed[new_key] = v
             else:
@@ -140,14 +134,12 @@ def load_from_checkpoint(generator, discriminator, g_optimizer, d_optimizer, che
     
     generator.load_state_dict(gen_state)
     
-    # Load discriminator state dict with prefix handling  
     disc_state = checkpoint["discriminator_state_dict"]
     if any("_orig_mod" in k for k in disc_state.keys()):
         disc_state = strip_prefix(disc_state)
     
     discriminator.load_state_dict(disc_state)
     
-    # Optimizers should load fine
     g_optimizer.load_state_dict(checkpoint["g_optimizer_state_dict"])
     d_optimizer.load_state_dict(checkpoint["d_optimizer_state_dict"])
     
@@ -156,6 +148,7 @@ def load_from_checkpoint(generator, discriminator, g_optimizer, d_optimizer, che
     print(f"Successfully loaded checkpoint from epoch {checkpoint['epoch']}")
     
     return generator, discriminator, g_optimizer, d_optimizer, start_epoch
+
 
 def train_stylegan(config, checkpoint_path=None):
     
@@ -175,14 +168,13 @@ def train_stylegan(config, checkpoint_path=None):
         mapping_layers=config["mapping_layers"],
         style_mixing_prob=config["style_mixing_prob"]
     ).to(device)
-    generator = generator.to(memory_format=torch.channels_last)
-
+    
     discriminator = Discriminator(
         img_size=img_size,
         img_channels=3
     ).to(device)
-    discriminator = discriminator.to(memory_format=torch.channels_last)
     
+    # Use different learning rates for better stability
     g_optimizer = optim.Adam(
         generator.parameters(),
         lr=config["g_lr"],
@@ -202,7 +194,7 @@ def train_stylegan(config, checkpoint_path=None):
     dataset = CelebADataset(
         root=config["dataset_path"],
         transform=transform,
-        limit=10000  # the images in this repo is of a 10000 subset 
+        limit=10000
     )
     
     dataloader = DataLoader(
@@ -217,27 +209,24 @@ def train_stylegan(config, checkpoint_path=None):
     
     print(f"\nTraining Configuration:")
     print(f"- Image size: {img_size}x{img_size}")
-    print(f"- Z dimension: {z_dim}")
-    print(f"- W dimension: {w_dim}")
     print(f"- Batch size: {batch_size}")
     print(f"- Generator LR: {config['g_lr']}")
     print(f"- Discriminator LR: {config['d_lr']}")
-    print(f"- Style mixing prob: {config['style_mixing_prob']}")
     print(f"- R1 gamma: {config['r1_gamma']}")
     print(f"- Dataset size: {len(dataset)}")
     print(f"- Total epochs: {num_epochs}\n")
 
     start_epoch = 0
     if checkpoint_path and os.path.exists(checkpoint_path):
-        generator, discriminator, g_optimizer, d_optimizer, start_epoch = load_from_checkpoint(generator, discriminator, g_optimizer, d_optimizer, checkpoint_path)
-        print(f"resuming from {checkpoint_path} at epoch {start_epoch}")
+        generator, discriminator, g_optimizer, d_optimizer, start_epoch = load_from_checkpoint(
+            generator, discriminator, g_optimizer, d_optimizer, checkpoint_path
+        )
+        print(f"Resuming from {checkpoint_path} at epoch {start_epoch}")
     else:
-        print(f"starting training from epoch 0")
+        print(f"Starting training from epoch 0")
     
-    generator.synthesis = torch.compile(generator.synthesis)
-    discriminator = torch.compile(discriminator)
-
-
+    # generator.synthesis = torch.compile(generator.synthesis)
+    # discriminator = torch.compile(discriminator)
 
     g_losses = []
     d_losses = []
@@ -251,7 +240,6 @@ def train_stylegan(config, checkpoint_path=None):
         epoch_d_loss = 0
         epoch_r1 = 0
         num_batches = 0
-        g_updates = 0  # Track generator updates separately
         
         loop = tqdm(dataloader, leave=True, desc=f"Epoch {epoch+1}/{num_epochs}")
         
@@ -260,84 +248,75 @@ def train_stylegan(config, checkpoint_path=None):
             batch_size_actual = real_images.size(0)
             
             # ==================== Train Discriminator ====================
+            discriminator.requires_grad_(True)
+            generator.requires_grad_(False)
+            
             d_optimizer.zero_grad()
             
-            # Generate fake images
+            # Generate fake images (don't need gradients for G yet)
             z1 = torch.randn(batch_size_actual, z_dim, device=device)
             z2 = torch.randn(batch_size_actual, z_dim, device=device)
             
             with torch.no_grad():
                 fake_images, _ = generator(z1, z2)
             
-            # Discriminator scores
+            # Discriminator forward
             real_scores = discriminator(real_images)
-            fake_scores = discriminator(fake_images.detach())
+            fake_scores = discriminator(fake_images)
             
             # Discriminator loss
-            d_loss = discriminator_loss(real_scores, fake_scores)
+            d_loss = d_logistic_loss(real_scores, fake_scores)
             
-            # R1 regularization
-            r1_interval = config.get("r1_interval", 16)
+            # R1 regularization (applies every r1_interval steps)
             r1_penalty = torch.tensor(0.0, device=device)
-            
-            if batch_idx % r1_interval == 0:
-                r1_penalty = compute_gradient_penalty(discriminator, real_images, fake_images)
-                d_loss_total = d_loss + config["r1_gamma"] * r1_penalty * r1_interval
+            if batch_idx % config["r1_interval"] == 0:
+                r1_penalty = compute_gradient_penalty(discriminator, real_images)
+                d_loss_with_r1 = d_loss + config["r1_gamma"] / 2 * r1_penalty * config["r1_interval"]
                 epoch_r1 += r1_penalty.item()
             else:
-                d_loss_total = d_loss
+                d_loss_with_r1 = d_loss
             
-            scaler.scale(d_loss_total).backward()
-            
-            if config["grad_clip"]:
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), config["grad_clip"])
-            
-            scaler.step(d_optimizer)
-            scaler.update()
-
-            # ==================== Train Generator (Multiple Times) ====================
-            n_critic = config.get("n_critic", 2)  # Train G this many times per D update
-            
-            for _ in range(n_critic):
-                g_optimizer.zero_grad()
-                
-                # Generate new fake images
-                z1 = torch.randn(batch_size_actual, z_dim, device=device)
-                z2 = torch.randn(batch_size_actual, z_dim, device=device)
-                
-                fake_images, _ = generator(z1, z2)
-                
-                # Generator loss
-                fake_scores = discriminator(fake_images)
-                g_loss = generator_loss(fake_scores)
-                
-                scaler.scale(g_loss).backward()
-                
-                if config["grad_clip"]:
-                    torch.nn.utils.clip_grad_norm_(generator.parameters(), config["grad_clip"])
-                
-                scaler.step(g_optimizer)
-                scaler.update()
-                
-                epoch_g_loss += g_loss.item()
-                g_updates += 1
+            d_loss_with_r1.backward()
+            d_optimizer.step()
             
             epoch_d_loss += d_loss.item()
+            
+            # ==================== Train Generator ====================
+            discriminator.requires_grad_(False)
+            generator.requires_grad_(True)
+            
+            g_optimizer.zero_grad()
+            
+            # Generate new fake images for generator update
+            z1 = torch.randn(batch_size_actual, z_dim, device=device)
+            z2 = torch.randn(batch_size_actual, z_dim, device=device)
+            
+            fake_images, _ = generator(z1, z2)
+            fake_scores = discriminator(fake_images)
+            
+            # Generator loss
+            g_loss = g_nonsaturating_loss(fake_scores)
+            
+            g_loss.backward()
+            g_optimizer.step()
+            
+            epoch_g_loss += g_loss.item()
             num_batches += 1
             
             loop.set_postfix({
                 "G_loss": f"{g_loss.item():.4f}",
                 "D_loss": f"{d_loss.item():.4f}",
                 "R1": f"{r1_penalty.item():.4f}" if r1_penalty.item() > 0 else "0.0000",
+                "real_score": f"{real_scores.mean().item():.4f}",
+                "fake_score": f"{fake_scores.mean().item():.4f}",
             })
             
-            if batch_idx % 100 == 0:
+            if batch_idx % 200 == 0:
                 clear_memory()
         
-        avg_g_loss = epoch_g_loss / g_updates  # Divide by actual number of G updates
+        avg_g_loss = epoch_g_loss / num_batches
         avg_d_loss = epoch_d_loss / num_batches
-        avg_r1 = epoch_r1 / max(1, num_batches // r1_interval)
-    
+        avg_r1 = epoch_r1 / max(1, num_batches // config["r1_interval"])
         
         g_losses.append(avg_g_loss)
         d_losses.append(avg_d_loss)
@@ -419,6 +398,8 @@ def plot_training_curves(g_losses, d_losses, r1_penalties, save_dir):
 
 
 if __name__ == "__main__":
-    
-    generator, discriminator, g_losses, d_losses = train_stylegan(training_config, checkpoint_path="/content/drive/MyDrive/stylegan_checkpoints/stylegan_checkpoint_epoch_22.pth")
+    generator, discriminator, g_losses, d_losses = train_stylegan(
+        training_config, 
+        checkpoint_path=None  # Set to your checkpoint path if resuming
+    )
     print("\n✓ Training completed successfully!")
